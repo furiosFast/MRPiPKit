@@ -13,15 +13,19 @@ It handles the parts of the AVKit lifecycle that are easy to get wrong: a stop d
 
 ## Features
 
-- **No subclassing.** `PiPHostingViewController(rootView:)` wraps any SwiftUI view.
-- **One lifecycle state.** A private phase enum tracks the AVKit session, so impossible combinations, such as a start confirmed while the receiver is being released, cannot be represented.
-- **Bounded waits.** Startup timeouts, three stop renewals, a forced release and a bounded receiver flush: a silent AVKit never leaves your PiP controls locked.
-- **Immediate release in background.** AVKit does not answer `stopPictureInPicture()` while the app is in background, with the screen locked or another app in front, so such a stop releases the session at once, which closes the window.
+- **No subclassing.** `PiPControllerSlot` makes the hosting controller around any SwiftUI view you give `activate`; controllers are never created directly, because only the slot anchors, sizes and wires them.
+- **One lifecycle state.** An internal phase enum tracks preparation, startup, playback, cancellation, stopping and teardown.
+- **Bounded waits.** Startup timeouts, up to three stop renewals, forced release and a receiver teardown timeout handle missing AVKit callbacks. Before a start request is sent, preparation waits while the source scene or app is inactive; its timeout resumes when both are active.
+- **Release in background.** A stop requested for an active PiP while the app is in background begins teardown without waiting for AVKit's stop callback. A stop already in progress does the same when the app enters background; receiver cleanup remains asynchronous.
 - **A stop during the start transition** waits for AVKit to confirm, then closes the window, instead of leaving a window nobody owns.
-- **Controller reuse.** `PiPControllerSlot` runs the start sequence, forwards exits, keeps the idle controller after a confirmed stop for the next start, clears that session's callbacks, gives it the new activation's content, rejects a start while one is still active, and drops the idle controller on a memory warning.
-- **Balanced transitions.** `transitionDidChange` reports `true` from the start request and while closing, and `false` once the window is up or the session has settled after a stop or a failure: controls locked with it never stay locked.
-- **Multi-window aware.** The source goes into a window of the foreground-active scene, where AVKit can start; without any window the start fails at once instead of timing out.
-- **Foreground animation.** After each update the window captures the SwiftUI animation for one second, at six frames per second by default, also while a table in the app is scrolling. Reduce Motion disables it.
+- **Controller reuse.** `PiPControllerSlot` configures controllers and forwards exits. After a confirmed stop and successful teardown, it keeps the idle controller for the next activation, supplies fresh content and clears the previous session's callbacks. It rejects activation while a controller is active or closing, and drops the idle controller on a memory warning.
+- **Completions you can wait on.** `deactivate(completion:)` waits for teardown, including when called again during a stop. If receiver cleanup exceeds its timeout, the pipeline is abandoned and the controller is discarded before the completions run.
+- **Transition notifications.** `transitionDidChange` reports `true` from the start request and while closing, and `false` once the window is up or teardown settles. Treat it as a Boolean state: `true` may repeat, and the single automatic startup retry keeps the transition open.
+- **Scene selection.** Window lookup prefers a foreground-active scene, then a foreground-inactive scene, then other scenes. Startup waits for the chosen scene and app to become active; if another scene of the app becomes active first, before the start request, the source moves to its window. Without a usable window it fails immediately. When several scenes share the same state, selection does not identify which one initiated the request.
+- **No orphans.** A slot that goes away closes its PiP, and a controller whose window AVKit closed without callbacks is never reused.
+- **Foreground animation.** After each update the window captures the SwiftUI animation for one second, at six frames per second by default, also while a table in the app is scrolling. Reduce Motion disables it, and so does `PiPControllerSlot(animationFramesPerSecond:)` with `nil`, zero or a negative value.
+- **Configurable background.** `PiPControllerSlot(backgroundColor:)` sets the opaque color behind the content, black by default; the images carry no transparency.
+- **Invisible in the app.** The off-screen copy of the content that feeds the PiP window is hidden from VoiceOver.
 - **Zero third-party dependencies**: AVKit, SwiftUI, UIKit and Combine only.
 
 ## Requirements
@@ -47,6 +51,8 @@ Then add `MRPiPKit` to your target dependencies. In Xcode, use **File ▸ Add Pa
 
 ## Usage
 
+The example uses your own `GaugeView` and `GaugeModel` types. Keep the `GaugePiP` owner alive for the session and subscribe to `exits` to call `stop(completion:)` and clear your app's session state after an external close or failed start.
+
 ```swift
 import AVFoundation
 import Combine
@@ -55,7 +61,8 @@ import SwiftUI
 
 @MainActor
 final class GaugePiP {
-    /// `animationFramesPerSecond: nil` renders only explicit updates.
+    /// `PiPControllerSlot(animationFramesPerSecond: nil)` renders only explicit updates; `backgroundColor:` replaces the
+    /// black behind the content.
     private let slot = PiPControllerSlot<GaugeView>()
     private let model = GaugeModel()
 
@@ -89,7 +96,7 @@ final class GaugePiP {
     }
 
     func stop(completion: @escaping () -> Void) {
-        // The completion runs once AVKit has closed the window and released the video pipeline.
+        // Wait for teardown to finish, or for its timeout to discard the pipeline.
         slot.deactivate(completion: completion)
     }
 }
@@ -97,11 +104,9 @@ final class GaugePiP {
 
 The kit drives one PiP per slot. Which PiP is active, the handoff between them and the audio session belong to your app.
 
-`didFail` receives `PiPStartRejectedError` when a slot still has an active controller: close your session in that case, because no window will report its end. Any other error means AVKit did not show the window; an exit follows.
+Start a replacement session from the completion of `deactivate(completion:)`, when the slot is available again. Explicit stops do not emit an exit event. In background, call `scheduleRendering()` whenever your model changes: the foreground animation timer does not run there.
 
-### Private API
-
-The controller sets the private `controlsStyle` key, which hides the playback controls that mean nothing for live content. The key is set only when the class still answers to it, so a future system without it keeps the controls instead of crashing.
+`didFail` receives `PiPStartRejectedError` when a slot still has an active controller, or one still closing: close your session in that case, because no window will report its end, and start the next session from the completion of `deactivate(completion:)`. Any other error means AVKit did not show the window; an exit follows.
 
 ### Logging
 

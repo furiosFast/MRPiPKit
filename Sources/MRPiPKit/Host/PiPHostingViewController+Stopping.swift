@@ -47,7 +47,9 @@ extension PiPHostingViewController {
                 if controller?.isPictureInPictureActive == true, renewals < PiPTimings.stopRenewalLimit {
                     renewals += 1
                     PiPKitLog.d("PiP AVKit: chiusura ancora in corso, rinnovo della richiesta di arresto (\(renewals)/\(PiPTimings.stopRenewalLimit))")
-                    controller?.stopPictureInPicture()
+                    if let controller {
+                        requestWindowClose(controller)
+                    }
                     continue
                 }
                 // Past the renewals AVKit never confirmed: release the source anyway rather than lock every switch,
@@ -66,6 +68,15 @@ extension PiPHostingViewController {
                 PiPKitLog.d("PiP AVKit: app in background durante la chiusura, rilascio senza attendere AVKit")
                 releaseWithoutStopConfirmation()
             }
+    }
+
+    /// Asks AVKit to close the window of a session that is stopping. In background AVKit answers no stop request: the
+    /// observer in `beginStopping()` covers a later move to the background, this check a stop that starts there.
+    func requestWindowClose(_ pictureInPictureController: AVPictureInPictureController) {
+        pictureInPictureController.stopPictureInPicture()
+        guard phase == .stopping, isAppInBackground else { return }
+        PiPKitLog.d("PiP AVKit: arresto con l'app in background, rilascio senza attendere AVKit")
+        releaseWithoutStopConfirmation()
     }
 
     /// Ends a stop AVKit has not confirmed: releasing the source and the controller closes the window, and that

@@ -68,7 +68,7 @@ extension PiPHostingViewController {
         let scale = displayScale
         let content = rootView
             .frame(width: size.width, height: size.height)
-            .background(Color(uiColor: view.backgroundColor ?? .black))
+            .background(Color(uiColor: contentBackgroundColor))
             .environment(\.colorScheme, traitCollection.userInterfaceStyle == .dark ? .dark : .light)
             .environment(\.displayScale, scale)
             .transaction {

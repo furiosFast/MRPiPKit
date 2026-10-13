@@ -25,4 +25,9 @@ extension NSError {
     static var pipContentUnavailable: NSError {
         NSError(domain: "MRPiPKit", code: 1, userInfo: [NSLocalizedDescriptionKey: "Picture in Picture content is not available"])
     }
+
+    /// Reported when no window can host the AVKit source, so the start cannot even be requested.
+    static var pipNoWindow: NSError {
+        NSError(domain: "MRPiPKit", code: 2, userInfo: [NSLocalizedDescriptionKey: "No window can host the Picture in Picture source"])
+    }
 }

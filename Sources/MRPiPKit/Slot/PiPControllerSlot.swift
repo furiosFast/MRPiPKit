@@ -25,15 +25,22 @@ public final class PiPControllerSlot<Content: View> {
     }
 
     private let animationFramesPerSecond: Int?
+    private let backgroundColor: UIColor
     private var idle: PiPHostingViewController<Content>?
+    /// The controller `deactivate` is stopping, until its teardown completes.
+    private var closing: PiPHostingViewController<Content>?
     private let exitSubject = PassthroughSubject<Void, Never>()
     private var exitObservation: AnyCancellable?
     private var memoryWarningObservation: AnyCancellable?
 
-    /// - Parameter animationFramesPerSecond: Given to every controller the slot makes; see
-    ///   ``PiPHostingViewController/animationFramesPerSecond``.
-    public init(animationFramesPerSecond: Int? = 6) {
+    /// - Parameters:
+    ///   - animationFramesPerSecond: Frame rate of the animation captured in the foreground for one second after each
+    ///     update, six by default. `nil`, zero or a negative value renders only explicit updates, for content that must
+    ///     not animate, such as a screen-capture readout that would count its own redraws.
+    ///   - backgroundColor: Opaque color behind the content, black by default; the images carry no transparency.
+    public init(animationFramesPerSecond: Int? = 6, backgroundColor: UIColor = .black) {
         self.animationFramesPerSecond = animationFramesPerSecond
+        self.backgroundColor = backgroundColor
         // An idle controller only saves the next start some work: under memory pressure it is the first thing to go.
         // The active one is untouched, and the next start simply makes a new controller.
         memoryWarningObservation = NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)
@@ -46,13 +53,15 @@ public final class PiPControllerSlot<Content: View> {
     }
 
     /// Reuses the idle controller of the previous confirmed stop, with `makeContent()` as its new root, or makes one around
-    /// it; configures it
-    /// for this session, anchors it off screen at `size` and makes it the active one; its exits reach
-    /// `exitPublisher` until `deactivate`. While a controller is still active the start is rejected through
-    /// `didFail` with `PiPStartRejectedError`, which the caller answers by closing its session.
+    /// it; configures it for this session, anchors it off screen at `size` and makes it the active one; its exits reach
+    /// `exitPublisher` until `deactivate`. While a controller is still active, or the previous one is still closing, the
+    /// start is rejected through `didFail` with `PiPStartRejectedError`, which the caller answers by closing its session:
+    /// start the next session from the completion of `deactivate`.
     public func activate(interfaceStyle: UIUserInterfaceStyle, size: CGSize, transitionDidChange: @escaping (Bool) -> Void, didFail: @escaping (Error) -> Void, makeContent: () -> Content) -> PiPHostingViewController<Content>? {
-        guard active == nil else {
-            PiPKitLog.d("PiP: avvio rifiutato, un controller è ancora attivo")
+        // One controller at a time: a new session never overlaps the teardown of the previous one, so `closing` always
+        // names the only pending stop that a later `deactivate` waits for.
+        guard active == nil, closing == nil else {
+            PiPKitLog.d(active != nil ? "PiP: avvio rifiutato, un controller è ancora attivo" : "PiP: avvio rifiutato, il controller precedente sta ancora chiudendo")
             didFail(PiPStartRejectedError())
             return nil
         }
@@ -63,7 +72,7 @@ public final class PiPControllerSlot<Content: View> {
             idle.rootView = content
             controller = idle
         } else {
-            controller = PiPHostingViewController(rootView: content, animationFramesPerSecond: animationFramesPerSecond)
+            controller = PiPHostingViewController(rootView: content, animationFramesPerSecond: animationFramesPerSecond, backgroundColor: backgroundColor)
         }
         idle = nil
         controller.configureView(interfaceStyle: interfaceStyle)
@@ -75,13 +84,23 @@ public final class PiPControllerSlot<Content: View> {
         return controller
     }
 
-    /// Stops the active controller and detaches its view; keeps it idle only when AVKit confirmed the stop.
+    /// Stops the active controller and detaches its view; keeps it idle only when AVKit confirmed the stop. The completion
+    /// runs once the window is closed and the video pipeline released, also when a stop is already in progress.
     public func deactivate(completion: @escaping () -> Void) {
         guard let controller = active else {
-            completion()
+            // A stop still in progress: this completion waits for the same teardown instead of running early.
+            if let closing {
+                closing.stopPictureInPicture(completion: completion)
+            } else {
+                completion()
+            }
             return
         }
+        closing = controller
         controller.stopPictureInPicture { [weak self, weak controller] in
+            if let self, closing === controller {
+                closing = nil
+            }
             if let controller, controller.canRestartPictureInPicture {
                 // An idle controller keeps nothing of the session that ended: the next activation sets its own callbacks.
                 controller.didFail = nil
@@ -93,5 +112,12 @@ public final class PiPControllerSlot<Content: View> {
         active = nil
         exitObservation = nil
         controller.view.removeFromSuperview()
+    }
+
+    /// An owner that goes away must not leave its PiP window and hidden view behind. The controller retains itself while
+    /// closing, so the teardown completes after the slot is gone.
+    isolated deinit {
+        active?.stopPictureInPicture(completion: nil)
+        active?.view.removeFromSuperview()
     }
 }

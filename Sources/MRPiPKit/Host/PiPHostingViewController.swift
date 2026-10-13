@@ -23,13 +23,19 @@ import SwiftUI
 public final class PiPHostingViewController<Content: View>: UIHostingController<Content>, @MainActor AVPictureInPictureControllerDelegate, AVPictureInPictureSampleBufferPlaybackDelegate {
     /// Frame rate of the foreground animation snapshots taken after each update. `nil` renders only explicit updates,
     /// for content that must not animate, such as a screen-capture readout that would count its own redraws.
-    public let animationFramesPerSecond: Int?
+    let animationFramesPerSecond: Int?
+    /// Painted behind the content, in the PiP window and in every image sent to AVKit.
+    let contentBackgroundColor: UIColor
 
+    /// Made only by `PiPControllerSlot`, which anchors, sizes and wires the controller before its start: one made anywhere
+    /// else would never show a window.
     /// - Parameters:
     ///   - rootView: The SwiftUI content of the PiP window.
-    ///   - animationFramesPerSecond: Six by default; see ``animationFramesPerSecond``.
-    public init(rootView: Content, animationFramesPerSecond: Int? = 6) {
-        self.animationFramesPerSecond = animationFramesPerSecond
+    ///   - animationFramesPerSecond: Positive frame rate; `nil`, zero or a negative value disables the animation frames.
+    ///   - backgroundColor: Opaque color behind the content; the images carry no transparency.
+    init(rootView: Content, animationFramesPerSecond: Int?, backgroundColor: UIColor) {
+        self.animationFramesPerSecond = animationFramesPerSecond.flatMap { $0 > 0 ? $0 : nil }
+        contentBackgroundColor = backgroundColor
         super.init(rootView: rootView)
     }
 
@@ -97,7 +103,9 @@ public final class PiPHostingViewController<Content: View>: UIHostingController<
 
     func configureView(interfaceStyle: UIUserInterfaceStyle) {
         overrideUserInterfaceStyle = interfaceStyle
-        view.backgroundColor = .black
+        view.backgroundColor = contentBackgroundColor
+        // The content is seen in the PiP window: its copy in the app, off screen, must not reach VoiceOver.
+        view.accessibilityElementsHidden = true
         additionalSafeAreaInsets = .zero
         view.insetsLayoutMarginsFromSafeArea = false
         view.preservesSuperviewLayoutMargins = false
@@ -152,8 +160,8 @@ public final class PiPHostingViewController<Content: View>: UIHostingController<
 
     // MARK: - Session
 
-    /// Starts the PiP window for the content. The start is asynchronous: `transitionDidChange` reports when it settles,
-    /// and `didFail` when AVKit did not show the window.
+    /// Starts the PiP window for the content. The start is asynchronous: the `transitionDidChange` given to the slot's
+    /// `activate` reports when it settles, and its `didFail` when AVKit did not show the window.
     public func startPictureInPicture() {
         guard phase == .idle, controller == nil || canReuseController else {
             // The slot never reaches this. A caller that does gets a rejected start, which it answers by closing its
@@ -170,10 +178,12 @@ public final class PiPHostingViewController<Content: View>: UIHostingController<
         hasEnqueuedImage = false
         transitionDidChange?(true)
         guard let controller = attachSource() else {
-            // Without a window the source cannot be attached: report the failure at once instead of after a timeout.
+            // Without a window the source cannot be attached: fail at once instead of after a timeout, through the same
+            // release as any failed start, which also settles the transition.
             PiPKitLog.d("PiP AVKit: nessuna finestra per la sorgente, avvio non possibile")
-            phase = .idle
-            reportStartFailure(NSError.pipContentUnavailable)
+            markExplicitStop()
+            releaseRendering()
+            reportStartFailure(NSError.pipNoWindow)
             return
         }
         observeReadiness()
@@ -204,17 +214,18 @@ public final class PiPHostingViewController<Content: View>: UIHostingController<
                     if phase.hasRequestedStart {
                         PiPKitLog.d("PiP AVKit: avvio non confermato annullato, rimozione della sorgente")
                     }
+                    if phase == .active {
+                        // AVKit ended the window without WillStop or DidStop: that controller's state is unknown.
+                        PiPKitLog.d("PiP AVKit: finestra già chiusa senza callback, controller non riutilizzabile")
+                        canReuseController = false
+                    }
                     releaseRendering()
                     return
                 }
                 beginStopping()
                 controller.canStartPictureInPictureAutomaticallyFromInline = false
                 // A visible PiP keeps its source and last image until AVKit completes the closing animation.
-                controller.stopPictureInPicture()
-                if isAppInBackground {
-                    PiPKitLog.d("PiP AVKit: arresto con l'app in background, rilascio senza attendere AVKit")
-                    releaseWithoutStopConfirmation()
-                }
+                requestWindowClose(controller)
         }
     }
 

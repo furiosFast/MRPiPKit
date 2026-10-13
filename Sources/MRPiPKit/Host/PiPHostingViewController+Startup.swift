@@ -105,6 +105,7 @@ extension PiPHostingViewController {
 
     func startIfPossible() {
         guard case .preparing = phase, let controller, !controller.isPictureInPictureActive else { return }
+        moveSourceToActiveSceneIfNeeded()
         guard isSourceForegroundActive else {
             cancelStartupTimeout()
             return
@@ -133,6 +134,17 @@ extension PiPHostingViewController {
         }
     }
 
+    /// Before the start is requested, a source left in a scene that is not active moves to the window of the active scene.
+    /// Activated while the whole app was in background, the controller went to a background scene's window; on iPad the
+    /// user can come back through another window, and the start would wait for a scene that may never come back.
+    func moveSourceToActiveSceneIfNeeded() {
+        guard !isSourceForegroundActive, let window = UIApplication.shared.pipKeyWindow, window !== sourceView.window,
+              window.windowScene?.activationState == .foregroundActive else { return }
+        PiPKitLog.d("PiP AVKit: sorgente spostata nella finestra della scena attiva prima della richiesta di avvio")
+        window.addSubview(view)
+        window.insertSubview(sourceView, at: 0)
+    }
+
     /// AVKit accepts a start only with a first image ready for display and PiP possible right now.
     func isReadyToRequestStart(_ controller: AVPictureInPictureController) -> Bool {
         hasEnqueuedImage && displayLayer.isReadyForDisplay && controller.isPictureInPicturePossible
@@ -148,8 +160,10 @@ extension PiPHostingViewController {
         guard startupTask == nil else { return }
         startupTask = Task { [weak self] in
             do { try await Task.sleep(for: PiPTimings.startupTimeout) } catch { return }
-            guard !Task.isCancelled, let self, phase.isLive || phase == .cancellingStart, let controller else { return }
+            guard !Task.isCancelled, let self else { return }
+            // Cleared before any other check: a stale reference would block every later timeout.
             startupTask = nil
+            guard phase.isLive || phase == .cancellingStart, let controller else { return }
             if controller.isPictureInPictureActive {
                 // The window is up but DidStart never came: settle the start instead of staying in transition.
                 confirmStart(of: controller, message: "PiP AVKit: finestra attiva senza conferma di avvio, sessione considerata avviata")
@@ -235,7 +249,8 @@ extension PiPHostingViewController {
                 phase = .active
                 beginStopping()
             }
-            pictureInPictureController.stopPictureInPicture()
+            // The app may already be in background, where the observer of `beginStopping()` would never fire.
+            requestWindowClose(pictureInPictureController)
             return
         }
         phase = .active
